@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <string.h>
 #include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -15,8 +16,12 @@
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_vendor.h"
 #include "driver/gpio.h"
+#include "esp_timer.h"
+#include "esp_log.h"
 
 #include "config.h"
+
+static const char *TAG = "CameraApp";
 
 static esp_lcd_panel_handle_t panel_handle = NULL;
 static QueueHandle_t display_queue = NULL;
@@ -24,6 +29,17 @@ static uint8_t *cam_buffers[NUM_CAM_BUFFERS] = {NULL};
 static size_t cam_buffer_size = 0;
 static uint16_t *scaled_buffer = NULL;  // 缩放后的缓冲区
 static int trans_finished_count = 0;
+
+// 全局变量存储缩放参数
+static int scaled_width = 0;
+static int scaled_height = 0;
+static float scale = 0;
+static int x_offset = 0;
+static int y_offset = 0;
+static int src_width = 0;
+static int src_height = 0;
+static int dst_width = 0;
+static int dst_height = 0;
 
 
 // 屏幕旋转
@@ -67,7 +83,7 @@ static void init_lcd_display(void)
         .miso_io_num = LCD_PIN_NUM_MISO,
         .quadwp_io_num = -1,
         .quadhd_io_num = -1,
-        .max_transfer_sz = LCD_DISP_H_RES * 80 * sizeof(uint16_t),
+        .max_transfer_sz = LCD_DISP_H_RES * LCD_DISP_V_RES * sizeof(uint16_t),
     };
     ESP_ERROR_CHECK(spi_bus_initialize(LCD_HOST, &buscfg, SPI_DMA_CH_AUTO));
 
@@ -103,31 +119,33 @@ static void init_lcd_display(void)
     gpio_set_level(LCD_PIN_NUM_BK_LIGHT, LCD_DISP_BK_LIGHT_ON_LEVEL);
 }
 
-// 图像缩放函数
-static void scale_image(uint16_t *src, uint16_t *dst)
+// 初始化缩放参数和映射表
+static void init_scaling_params(void)
 {
-    const int src_width = CSI_MIPI_CSI_DISP_HRES;
-    const int src_height = CSI_MIPI_CSI_DISP_VRES;
-    const int dst_width = LCD_DISP_H_RES;
-    const int dst_height = LCD_DISP_V_RES;
-
-    // 将整个目标图像初始化为0（黑色）
-    for (int i = 0; i < dst_width * dst_height; i++) {
-        dst[i] = 0x00;
-    }
+    src_width = CSI_MIPI_CSI_DISP_HRES;
+    src_height = CSI_MIPI_CSI_DISP_VRES;
+    dst_width = LCD_DISP_H_RES;
+    dst_height = LCD_DISP_V_RES;
 
     // 计算缩放比例（取宽高比中较小的比例）
     const float width_ratio = (float)dst_width / src_width;
     const float height_ratio = (float)dst_height / src_height;
-    const float scale = (width_ratio < height_ratio) ? width_ratio : height_ratio;
+    scale = (width_ratio < height_ratio) ? width_ratio : height_ratio;
 
     // 计算缩放后的实际尺寸
-    const float scaled_width = (int)(src_width * scale);
-    const float scaled_height = (int)(src_height * scale);
+    scaled_width = (int)(src_width * scale);
+    scaled_height = (int)(src_height * scale);
 
     // 计算居中偏移量
-    const int x_offset = (dst_width - scaled_width) / 2;
-    const int y_offset = (dst_height - scaled_height) / 2;
+    x_offset = (dst_width - scaled_width) / 2;
+    y_offset = (dst_height - scaled_height) / 2;
+}
+
+// 图像缩放函数
+static void IRAM_ATTR scale_image(uint16_t *src, uint16_t *dst)
+{
+    // 将整个目标图像初始化为0（黑色）
+    memset(dst, 0x00, dst_width * dst_height * sizeof(uint16_t));
 
     // 使用最近邻插值进行缩放
     for (int y = 0; y < scaled_height; y++) {
@@ -140,24 +158,8 @@ static void scale_image(uint16_t *src, uint16_t *dst)
             const int safe_src_x = (src_x < src_width) ? src_x : src_width - 1;
             const int safe_src_y = (src_y < src_height) ? src_y : src_height - 1;
 
-            // 写入目标图像（居中位置）
-            // dst[(y + y_offset) * dst_width + (x + x_offset)] =
-            //     src[safe_src_y * src_width + safe_src_x];
-
-            // 修改开始：添加RGB565到BGR565的转换
-            uint16_t rgb = src[safe_src_y * src_width + safe_src_x];
-
-            // 分解RGB565通道
-            uint16_t r = (rgb >> 11) & 0x1F;  // 提取红色 (5位)
-            uint16_t g = (rgb >> 5)  & 0x3F;  // 提取绿色 (6位)
-            uint16_t b = rgb & 0x1F;           // 提取蓝色 (5位)
-
-            // 重新组合为BGR565 (蓝色在前)
-            uint16_t bgr = (b << 11) | (g << 5) | r;
-
-            // 写入目标图像（居中位置）
-            dst[(y + y_offset) * dst_width + (x + x_offset)] = bgr;
-            // 修改结束
+            dst[(y + y_offset) * dst_width + (x + x_offset)] =
+                __builtin_bswap16(src[safe_src_y * src_width + safe_src_x]);
         }
     }
 }
@@ -187,38 +189,66 @@ static bool IRAM_ATTR camera_trans_finished(esp_cam_ctlr_handle_t handle, esp_ca
 void display_task(void *arg)
 {
     uint8_t *frame_data;
+    int64_t last_frame_time = esp_timer_get_time();
     while (1) {
-        if (xQueueReceive(display_queue, &frame_data, portMAX_DELAY)) {
+        if (xQueueReceive(display_queue, &frame_data, pdMS_TO_TICKS(50))) {
+            // 跳过堆积的帧（只处理最新帧）
+            while (uxQueueMessagesWaiting(display_queue) > 0) {
+                xQueueReceive(display_queue, &frame_data, 0);
+            }
+
             // 缩放图像
+            int64_t start = esp_timer_get_time();
             scale_image((uint16_t*)frame_data, scaled_buffer);
+            int64_t scale_time = esp_timer_get_time() - start;
 
             // 显示到LCD
+            start = esp_timer_get_time();
             esp_lcd_panel_draw_bitmap(panel_handle, 0, 0,
                                      LCD_DISP_H_RES, LCD_DISP_V_RES,
                                      scaled_buffer);
+            int64_t draw_time = esp_timer_get_time() - start;
+
+            // 性能监控
+            int64_t now = esp_timer_get_time();
+            int64_t frame_interval = now - last_frame_time;
+            last_frame_time = now;
+
+            ESP_LOGD(TAG, "Frame processed: scale=%lldµs, draw=%lldµs, interval=%lldµs",
+                     scale_time, draw_time, frame_interval);
         }
     }
 }
 
 void app_main(void)
 {
+    ESP_LOGI(TAG, "Application starting...");
+
     // 1. 初始化LCD显示屏
     init_lcd_display();
     lcd_rotate(LCD_DISP_ROTATE);
+    ESP_LOGI(TAG, "LCD initialized");
 
     // 2. 分配缩放缓冲区
-    scaled_buffer = heap_caps_malloc(LCD_DISP_H_RES * LCD_DISP_V_RES * sizeof(uint16_t), MALLOC_CAP_DMA);
+    init_scaling_params();
+    scaled_buffer = heap_caps_malloc(LCD_DISP_H_RES * LCD_DISP_V_RES * sizeof(uint16_t),
+                                   MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
     assert(scaled_buffer != NULL);
+    ESP_LOGI(TAG, "Scaled buffer allocated: %d bytes",
+            LCD_DISP_H_RES * LCD_DISP_V_RES * sizeof(uint16_t));
 
     // 3. 创建显示队列
     display_queue = xQueueCreate(5, sizeof(uint8_t*));
     assert(display_queue != NULL);
+    ESP_LOGI(TAG, "Display queue created");
 
     // 4. 创建显示任务
-    xTaskCreate(display_task, "display_task", 4096, NULL, 5, NULL);
+    xTaskCreate(display_task, "display_task", 4096, NULL, 8, NULL);
+    ESP_LOGI(TAG, "Display task created");
 
     // 5. 初始化CSI摄像头
     cam_buffer_size = CSI_MIPI_CSI_DISP_HRES * CSI_MIPI_CSI_DISP_VRES * 2;  // RGB565: 2 bytes per pixel
+    ESP_LOGI(TAG, "Camera buffer size: %d bytes", cam_buffer_size);
 
     // 初始化MIPI LDO
     esp_ldo_channel_handle_t ldo_mipi_phy = NULL;
@@ -227,6 +257,7 @@ void app_main(void)
         .voltage_mv = CSI_USED_LDO_VOLTAGE_MV,
     };
     ESP_ERROR_CHECK(esp_ldo_acquire_channel(&ldo_config, &ldo_mipi_phy));
+    ESP_LOGI(TAG, "LDO initialized");
 
     // 分配摄像头帧缓冲区
     size_t frame_buffer_alignment = 0;
@@ -234,9 +265,11 @@ void app_main(void)
     for (int i = 0; i < NUM_CAM_BUFFERS; i++) {
         cam_buffers[i] = heap_caps_aligned_calloc(frame_buffer_alignment, 1,
                                                  cam_buffer_size,
-                                                 MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+                                                 MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);  // 添加DMA标志
         assert(cam_buffers[i] != NULL);
+        ESP_LOGD(TAG, "Camera buffer %d allocated: %p", i, cam_buffers[i]);
     }
+    ESP_LOGI(TAG, "%d camera buffers allocated", NUM_CAM_BUFFERS);
 
     // 初始化摄像头传感器
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0)
@@ -252,6 +285,7 @@ void app_main(void)
         .format_name   = CSI_CAM_FORMAT,
     };
     example_sensor_init(&sensor_config, &sensor_handle);
+    ESP_LOGI(TAG, "Camera sensor initialized");
 
     // 初始化CSI控制器
     esp_cam_ctlr_csi_config_t csi_config = {
@@ -267,6 +301,7 @@ void app_main(void)
     };
     esp_cam_ctlr_handle_t cam_handle = NULL;
     ESP_ERROR_CHECK(esp_cam_new_csi_ctlr(&csi_config, &cam_handle));
+    ESP_LOGI(TAG, "CSI controller initialized");
 
     // 注册事件回调
     esp_cam_ctlr_evt_cbs_t cbs = {
@@ -275,6 +310,7 @@ void app_main(void)
     };
     ESP_ERROR_CHECK(esp_cam_ctlr_register_event_callbacks(cam_handle, &cbs, NULL));
     ESP_ERROR_CHECK(esp_cam_ctlr_enable(cam_handle));
+    ESP_LOGI(TAG, "Camera event callbacks registered");
 
     // 初始化ISP处理器
     isp_proc_handle_t isp_proc = NULL;
@@ -283,20 +319,33 @@ void app_main(void)
         .input_data_source     = ISP_INPUT_DATA_SOURCE_CSI,
         .input_data_color_type = ISP_COLOR_RAW8,
         .output_data_color_type = ISP_COLOR_RGB565,
-        .has_line_start_packet = false,
-        .has_line_end_packet   = false,
+        .has_line_start_packet = true,  // 启用行同步
+        .has_line_end_packet   = true,  // 启用行结束
         .h_res                 = CSI_MIPI_CSI_DISP_HRES,
         .v_res                 = CSI_MIPI_CSI_DISP_VRES,
     };
     ESP_ERROR_CHECK(esp_isp_new_processor(&isp_config, &isp_proc));
     ESP_ERROR_CHECK(esp_isp_enable(isp_proc));
+    ESP_LOGI(TAG, "ISP processor initialized");
 
     // 6. 启动摄像头捕获
     ESP_ERROR_CHECK(esp_cam_ctlr_start(cam_handle));
+    ESP_LOGI(TAG, "Camera capture started");
 
-    // 主循环 - 只需保持运行
+    // 主循环 - 监控性能
+    int64_t last_log_time = esp_timer_get_time();
+
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(1000));
+
+        // 每秒记录一次状态
+        int64_t now = esp_timer_get_time();
+        if (now - last_log_time > 1000000) {
+            ESP_LOGI(TAG, "Frames processed: %d, Queue depth: %d",
+                    trans_finished_count, uxQueueMessagesWaiting(display_queue));
+            trans_finished_count = 0;
+            last_log_time = now;
+        }
     }
 
     // 清理代码（实际不会执行到这里）
