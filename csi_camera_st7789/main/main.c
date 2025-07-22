@@ -141,17 +141,23 @@ static void scale_image(uint16_t *src, uint16_t *dst)
             const int safe_src_y = (src_y < src_height) ? src_y : src_height - 1;
 
             // 写入目标图像（居中位置）
-            dst[(y + y_offset) * dst_width + (x + x_offset)] =
-                src[safe_src_y * src_width + safe_src_x];
+            // dst[(y + y_offset) * dst_width + (x + x_offset)] =
+            //     src[safe_src_y * src_width + safe_src_x];
 
-            /* 若需要交换R/B通道（RGB565->BGR565），使用以下代码：
+            // 修改开始：添加RGB565到BGR565的转换
             uint16_t rgb = src[safe_src_y * src_width + safe_src_x];
-            uint16_t r = (rgb >> 11) & 0x1F;
-            uint16_t g = (rgb >> 5) & 0x3F;
-            uint16_t b = rgb & 0x1F;
-            dst[(y + y_offset) * dst_width + (x + x_offset)] =
-                (b << 11) | (g << 5) | r;
-            */
+
+            // 分解RGB565通道
+            uint16_t r = (rgb >> 11) & 0x1F;  // 提取红色 (5位)
+            uint16_t g = (rgb >> 5)  & 0x3F;  // 提取绿色 (6位)
+            uint16_t b = rgb & 0x1F;           // 提取蓝色 (5位)
+
+            // 重新组合为BGR565 (蓝色在前)
+            uint16_t bgr = (b << 11) | (g << 5) | r;
+
+            // 写入目标图像（居中位置）
+            dst[(y + y_offset) * dst_width + (x + x_offset)] = bgr;
+            // 修改结束
         }
     }
 }
